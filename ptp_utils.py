@@ -195,8 +195,12 @@ def register_attention_control(model, controller):    #适用于diffusers版本0
             # attn = controller(attn, is_cross, place_in_unet)
             # out = torch.einsum("b i j, b j d -> b i d", attn, v)
             # out = self.batch_to_head_dim(out)
-
-            out = controller(q, k, v, sim, attn, is_cross, place_in_unet, h, scale=self.scale)
+            
+            if controller.enable:
+                out = controller(q, k, v, sim, attn, is_cross, place_in_unet, h, scale=self.scale)
+            else:
+                out = torch.einsum("b i j, b j d -> b i d", attn, v)
+                out = self.batch_to_head_dim(out)
             return to_out(out)
 
         return forward

@@ -27,46 +27,28 @@ import BeLM
 
 class LocalBlend:    
     def __call__(self, x_t, attention_store, t):
+        """
+        blend x_t
+        """
         k = 1
-
-        cross_maps = attention_store["down_cross"][2:4] + attention_store["up_cross"][:3]
-        cross_maps = [item.reshape(len(prompts), -1, 16, 16, item.shape[-1]) for item in cross_maps]    #[b, heads, 16, 16, 77]
-        cross_maps = torch.cat(cross_maps, dim=1)
-        cross_maps = cross_maps.sum(1) / cross_maps.shape[1]    #[b,16,16,77]
         
-        #cross_maps = cross_maps[:,:,:,2].unsqueeze(1)   #[b,1,16,16]
+        if self.mask is None:
+            cross_maps = attention_store["down_cross"][2:4] + attention_store["up_cross"][:3]
+            cross_maps = [item.reshape(len(prompts), -1, 16, 16, item.shape[-1]) for item in cross_maps]    #[b, heads, 16, 16, 77] * layers
+            cross_maps = torch.cat(cross_maps, dim=1)
+            cross_maps = cross_maps.sum(1) / cross_maps.shape[1]    #[b,16,16,77]
+            
+            #cross_maps = cross_maps[:,:,:,2].unsqueeze(1)   #[b,1,16,16]
 
-        cross_maps = cross_maps * self.alpha_layers.squeeze(1).squeeze(1) #[b,16,16,77]
-        cross_maps = cross_maps.sum(-1).unsqueeze(1)   #[b,1,16,16]
+            cross_maps = cross_maps * self.alpha_layers.squeeze(1).squeeze(1) #[b,16,16,77]
+            cross_maps = cross_maps.sum(-1).unsqueeze(1)   #[b,1,16,16]
 
-        cross_maps = nnf.interpolate(cross_maps, size=(x_t.shape[2:]), mode="bilinear").squeeze(1)  #[b,64,64]
-        cross_maps = cross_maps / cross_maps.max(dim=2, keepdims=True).values.max(dim=1, keepdims=True).values
-        cross_maps = cross_maps.gt(0.25)    #best 0.25
-        mask = cross_maps.float().unsqueeze(1)
-        #mask = (mask[:1] + mask[1:2]).float()
-
-        #save as image
-        cross_maps = cross_maps * 255.0
-        image = cross_maps.unsqueeze(-1).expand(*cross_maps.shape, 3)
-        image = image.cpu().numpy().astype(np.uint8)
-        Image.fromarray(image[0]).save(os.path.join(output_dir,"words0_map.jpg"))
-        Image.fromarray(image[1]).save(os.path.join(output_dir,"words1_map.jpg"))
-        Image.fromarray(image[2]).save(os.path.join(output_dir,"words2_map.jpg"))
-
-        # maps = attention_store["down_cross"][2:4] + attention_store["up_cross"][:3]  #list [[8b,256,77] * 5]
-        # maps = [item.reshape(self.alpha_layers.shape[0], -1, 1, 16, 16, MAX_NUM_WORDS) for item in maps]# list [b,8,1,16,16,77] * 5
-        # maps = torch.cat(maps, dim=1)  #[b, 8*5, 1, 16, 16, 77]
-        # maps = (maps * self.alpha_layers).sum(-1).mean(1) #[b,1,16,16], just certain words, averaged by layers and heads
-        # maps = maps[0:2, ...].clone().detach()  #抛弃ref mask
-        # mask = nnf.max_pool2d(maps, (k * 2 + 1, k * 2 +1), (1, 1), padding=(k, k)) #mask高亮增强
-        # mask = nnf.interpolate(mask, size=(x_t.shape[2:]))  #[b,1,64,64],mask插值到latent大小
-        # mask = mask / mask.max(2, keepdims=True)[0].max(3, keepdims=True)[0]  #mask自身归一
-        # mask = mask.gt(self.threshold)  #二值化
-        # mask = (mask[:1] + mask[1:2]).float() #src mask + tgt mask
-        # self.mask = mask
-        #mask=0时，被原图覆盖
-        #mask=1时，可以重新绘制
-        #只有对应词语的maps会比较明显
+            cross_maps = nnf.interpolate(cross_maps, size=(x_t.shape[2:]), mode="bilinear").squeeze(1)  #[b,64,64]
+            cross_maps = cross_maps / cross_maps.max(dim=2, keepdims=True).values.max(dim=1, keepdims=True).values
+            cross_maps = cross_maps.gt(0.25)    #best 0.25
+            mask = cross_maps.float().unsqueeze(1)
+        else:
+            mask = self.mask.float()
 
         x_t[1:2] = x_t[:1] + mask[0:1,...] * (x_t[1:2] - x_t[:1])
 
@@ -83,6 +65,12 @@ class LocalBlend:
         self.alpha_layers = alpha_layers.to(device)
         self.threshold = threshold
         self.mask = None
+    
+    def set_mask(self, mask):
+        """
+        mask size:[64,64],type 0 or 1
+        """
+        self.mask = mask  
 
 class AttentionControl(abc.ABC):
     #假设有batchsize = 2, heads = 8, 并且在uncond以及text共同堆叠推断下
@@ -119,7 +107,7 @@ class AttentionControl(abc.ABC):
 
         if kwargs.get("mode") == 'mask':
             #mask可能是导致质量低的原因
-            mask = self.get_ref_mask(ref_mask, mask_weight=mask_weight, H=H, W=W).to(device)   #[1,1,512,512]
+            mask = self.get_ref_mask(ref_mask, mask_weight=args.mask_weight, H=H, W=W).to(device)   #[1,1,512,512]
             mask = mask.masked_fill(mask == 0, torch.finfo(sim.dtype).min)
             sim[..., H*W:] = sim[..., H*W:] + mask
 
@@ -147,42 +135,8 @@ class AttentionControl(abc.ABC):
         k [16b or 8b, h*w, dim_k]
         v [16b or 8b, h*w, dim_k]
         """
-        def version_1():
-            qu, qc = q.chunk(2)
-            ku, kc = k.chunk(2)
-            vu, vc = v.chunk(2)
-
-            if self.cur_step < src_step and self.cur_att_layer // 2 in self.src_self_layer_idx:
-            #q_tgt = q_src  k_tgt = k_src 保持整体结构
-                qu[num_heads: 2*num_heads] = qu[:num_heads]
-                qc[num_heads: 2*num_heads] = qc[:num_heads]
-                ku[num_heads: 2*num_heads] = ku[:num_heads]
-                kc[num_heads: 2*num_heads] = kc[:num_heads]
-            
-            out_u_src = self.attn_batch(qu[:num_heads], ku[:num_heads], vu[:num_heads], None, None, is_cross, place_in_unet, num_heads, **kwargs)
-            out_c_src = self.attn_batch(qc[:num_heads], kc[:num_heads], vc[:num_heads], None, None, is_cross, place_in_unet, num_heads, **kwargs)
-            out_u_ref = self.attn_batch(qu[2*num_heads:], ku[2*num_heads:], vu[2*num_heads:], None, None, is_cross, place_in_unet, num_heads, **kwargs)
-            out_c_ref = self.attn_batch(qc[2*num_heads:], kc[2*num_heads:], vc[2*num_heads:], None, None, is_cross, place_in_unet, num_heads, **kwargs)
-
-            if self.cur_step < ref_step1 and self.cur_att_layer // 2 in self.ref_self_layer_idx:
-                #q_tgt k_ref v_ref 
-                out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[2*num_heads:], vu[2*num_heads:],None, None, is_cross, place_in_unet, num_heads, **kwargs)
-                out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[2*num_heads:], vc[2*num_heads:],None, None, is_cross, place_in_unet, num_heads, **kwargs)
-            elif self.cur_step < ref_step2 and self.cur_att_layer // 2 in self.ref_self_layer_idx:
-                #q_tgt [k_tgt,k_ref] [v_tgt,v_ref]
-                out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:], vu[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
-                out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:], vc[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
-            else:
-                #q_tgt k_tgt v_tgt
-                out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:2*num_heads], vu[num_heads:2*num_heads], None, None, is_cross, place_in_unet, num_heads, **kwargs)
-                out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:2*num_heads], vc[num_heads:2*num_heads], None, None, is_cross, place_in_unet, num_heads, **kwargs)
-            
-            out = torch.cat([out_u_src,out_u_tgt,out_u_ref,out_c_src,out_c_tgt,out_c_ref],dim=0)
-            return out
-
-        def version_2():
-            res = int(math.sqrt(q.shape[1]))
-            qu, qc = q.chunk(2)   #[8b, h*w, dim_q]
+        if not self.LOW_RESOURCE:
+            qu, qc = q.chunk(2)   #[8 * b, h*w, dim_q]
             ku, kc = k.chunk(2)
             vu, vc = v.chunk(2)
 
@@ -191,7 +145,7 @@ class AttentionControl(abc.ABC):
             out_u_ref = self.attn_batch(qu[2*num_heads:], ku[2*num_heads:], vu[2*num_heads:], None, None, is_cross, place_in_unet, num_heads, **kwargs)
             out_c_ref = self.attn_batch(qc[2*num_heads:], kc[2*num_heads:], vc[2*num_heads:], None, None, is_cross, place_in_unet, num_heads, **kwargs)
 
-            if self.cur_step < src_step and self.cur_att_layer // 2 in self.src_self_layer_idx:
+            if self.cur_step < args.self_src_q_time_end and self.cur_att_layer // 2 in self.src_self_layer_idx:
             #q_tgt = q_src  k_tgt = k_src 保持整体结构
                 qu[num_heads: 2*num_heads] = qu[:num_heads]
                 qc[num_heads: 2*num_heads] = qc[:num_heads]
@@ -199,29 +153,32 @@ class AttentionControl(abc.ABC):
                 kc[num_heads: 2*num_heads] = kc[:num_heads]
 
             #最好来个时间限制
-            if self.cur_step < ref_q_step and res >= ref_q_res:
-                mask = self.get_src_mask(src_mask, H=res, W=res).to(device)   #[res*res] 0背景 1前景
-                foreground_index, background_index = torch.where(mask == 1)[0], torch.where(mask == 0)[0]
-                dift_map = self.dift_map_dict[f"{res}"] #[h*w]
-                q_mix_scale = 1
-                qu[num_heads: 2*num_heads, foreground_index, :] = qu[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qu[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
-                qc[num_heads: 2*num_heads, foreground_index, :] = qc[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qc[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
+            res = int(math.sqrt(q.shape[1]))
+            if self.dift_map_dict is not None:
+                if self.cur_step < args.self_ref_q_time_end and self.cur_step >= args.self_ref_q_time_start and res >= args.self_ref_q_layer:
+                    mask = self.get_src_mask(src_mask, H=res, W=res).to(device)   #[res*res] 0背景 1前景
+                    foreground_index, background_index = torch.where(mask == 1)[0], torch.where(mask == 0)[0]
+                    dift_map = self.dift_map_dict[f"{res}"] #[h*w]
+                    q_mix_scale = 1.0
+                    qu[num_heads: 2*num_heads, foreground_index, :] = qu[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qu[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
+                    qc[num_heads: 2*num_heads, foreground_index, :] = qc[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qc[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
 
-            if self.cur_step < ref_step2 and self.cur_att_layer // 2 in self.ref_self_layer_idx:
+            if self.cur_step < args.self_ref_kv_time_end and self.cur_att_layer // 2 in self.ref_self_layer_idx:
                 #q_tgt [k_tgt,k_ref] [v_tgt,v_ref] 
                 out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:], vu[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
                 out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:], vc[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
+
+                #q_tgt k_ref v_ref 
+                # out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[2*num_heads:], vu[2*num_heads:],None, None, is_cross, place_in_unet, num_heads, **kwargs)
+                # out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[2*num_heads:], vc[2*num_heads:],None, None, is_cross, place_in_unet, num_heads, **kwargs)
             else:
                 #q_tgt k_tgt v_tgt
                 out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:2*num_heads], vu[num_heads:2*num_heads], None, None, is_cross, place_in_unet, num_heads, **kwargs)
                 out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:2*num_heads], vc[num_heads:2*num_heads], None, None, is_cross, place_in_unet, num_heads, **kwargs)
             
-            out = torch.cat([out_u_src,out_u_tgt,out_u_ref,out_c_src,out_c_tgt,out_c_ref],dim=0)
+            out = torch.cat([out_u_src, out_u_tgt, out_u_ref, out_c_src, out_c_tgt, out_c_ref],dim=0)
             return out
-
-        if not self.LOW_RESOURCE:
-            out = version_2() if self.dift_map_dict is not None else version_1()
-
+            
         else:
             pass
         
@@ -285,6 +242,9 @@ class AttentionControl(abc.ABC):
     def reset(self):
         self.cur_step = 0
         self.cur_att_layer = 0
+    
+    def set_enable(self, enable):
+        self.enable = enable
 
     def __init__(self):
         self.cur_step = 0
@@ -295,6 +255,7 @@ class AttentionControl(abc.ABC):
         self.ref_self_layer_idx = list(range(0, 16))
         self.src_cross_layer_idx = list(range(0, 16))
         self.dift_map_dict = None
+        self.enable = True
 
 class EmptyControl(AttentionControl):
     
@@ -504,13 +465,13 @@ def run_and_display(prompts, controller, latent=None, run_baseline=False, genera
     images = ptp_utils.view_images(images)
     images.save(os.path.join(output_dir,f"P2P_{seed}.png"))
 
-    controller.reset()
-    images, x_t = ptp_utils.text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DIFFUSION_STEPS, guidance_scale=GUIDANCE_SCALE, 
-                                                  generator=generator, low_resource=LOW_RESOURCE, uncond_embeddings=uncond_embeddings, ref_latent=ref_latent, 
-                                                  ref_uncond_embeddings=ref_uncond_embeddings, randomzt=True)
-    Image.fromarray(images[1]).save(os.path.join(output_dir,"P2P_tgt_randomzt.png"))
-    images = ptp_utils.view_images(images)
-    images.save(os.path.join(output_dir,"P2P_randomzt.png"))
+    # controller.reset()
+    # images, x_t = ptp_utils.text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DIFFUSION_STEPS, guidance_scale=GUIDANCE_SCALE, 
+    #                                               generator=generator, low_resource=LOW_RESOURCE, uncond_embeddings=uncond_embeddings, ref_latent=ref_latent, 
+    #                                               ref_uncond_embeddings=ref_uncond_embeddings, randomzt=True)
+    # Image.fromarray(images[1]).save(os.path.join(output_dir,"P2P_tgt_randomzt.png"))
+    # images = ptp_utils.view_images(images)
+    # images.save(os.path.join(output_dir,"P2P_randomzt.png"))
     
     return images, x_t
 
@@ -523,18 +484,17 @@ def load_mask(mask_path, H=512, W=512):
     return mask
 
 if __name__ == "__main__":
+    #超参数设置
     parser = argparse.ArgumentParser(description="hyper parameters")
-    parser.add_argument("--data_inds", type=str, default="0")
-    parser.add_argument("--ref_step1", type=str, default="20")
-    parser.add_argument("--ref_step2", type=str, default="50")
-    parser.add_argument("--ref_q_step", type=str, default="40")
-    parser.add_argument("--mask_weight", type=str, default="3.0")
-    parser.add_argument("--src_step", type=str, default="40")
-    parser.add_argument("--cross_step", type=str, default="0.6")
-    parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--ref_q_res", type=str, default="8")
+
+    parser.add_argument("--self_ref_kv_time_end", type=int, default="50")
+    parser.add_argument("--self_ref_q_time_start", type=int, default="0")
+    parser.add_argument("--self_ref_q_time_end", type=int, default="40")
+    parser.add_argument("--self_ref_q_layer", type=int, default="8")
+    parser.add_argument("--self_src_q_time_end", type=int, default="45")
+    parser.add_argument("--mask_weight", type=float, default="3.0")
+    parser.add_argument("--cross_step", type=float, default="0.6")
     parser.add_argument("--topk", action="store_true")
-    parser.add_argument("--BeLM", action="store_true")
     args = parser.parse_args()
 
     #model loading and config
@@ -542,7 +502,6 @@ if __name__ == "__main__":
     NUM_DIFFUSION_STEPS = 50
     GUIDANCE_SCALE = 7.5
     MAX_NUM_WORDS = 77
-    torch.cuda.set_device(args.gpu)
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
     ldm_stable = StableDiffusionPipeline.from_pretrained("/mnt/disk1/fengyanzhang/stable-diffusion-v1-5", scheduler=scheduler).to(device)
@@ -551,99 +510,80 @@ if __name__ == "__main__":
     
     dataset_path = "/home/yanzhang/dataset/customp2p"
     json_path = "prompt.json"
+    
     json_path = os.path.join(dataset_path,json_path)
     with open(json_path, "r", encoding="utf-8") as f:
         json_datas = json.load(f)
 
-    #注意每一次过unet就会被覆盖
+    #注意每过一次unet DIFT就会被覆盖
     dift_latent_store = DIFTLatentStore()
     register_DIFT(unet=ldm_stable.unet, dift_latent_store=dift_latent_store)
 
-    #load images & prompts & ref mask
-    i = int(args.data_inds.split(",")[0])
-    src_image_path = os.path.join(dataset_path, json_datas[i]["src_image"])
-    ref_image_path = os.path.join(dataset_path, json_datas[i]["ref_image"])
-    ref_mask_path = os.path.join(dataset_path, json_datas[i]["ref_mask"])
-    src_mask_path = os.path.join(dataset_path, json_datas[i]["src_mask"])
-    src_prompt = json_datas[i]["src_prompt"]
-    ref_prompt = json_datas[i]["ref_prompt"]
-    tgt_prompt = json_datas[i]["tgt_prompt"]
-    prompts = [src_prompt, tgt_prompt, ref_prompt]
-    ref_mask = load_mask(ref_mask_path)   #[1,1,512,512]
-    src_mask = load_mask(src_mask_path)
+    #load images & prompts & masks
 
-    # get dift features & gen dift map
-    print("calculating dift features......")
-    sdfeaturizer = SDFeaturizer(model=ldm_stable)
-    dift_latent_store.reset()
-    sdfeaturizer.forward(src_image_path, prompt=src_prompt, ensemble_size=8, t=451, up_ft_index=1, model=ldm_stable) 
-    src_dift = dift_latent_store.dift_features["1"].mean(0, keepdim=True)   # 1, c, 32, 32
-    dift_latent_store.reset()
-    sdfeaturizer.forward(ref_image_path, prompt=ref_prompt, ensemble_size=8, t=451, up_ft_index=1, model=ldm_stable)
-    ref_dift = dift_latent_store.dift_features["1"].mean(0, keepdim=True)   # 1, c, 32, 32
-    dift_map_dict, _ = gen_dift_map_dict(src_dift, ref_dift, ref_mask=ref_mask, use_topk=args.topk)
-    print("finishing dift features mapping!")
+    for i in range(len(json_datas)):
+        src_image_path = os.path.join(dataset_path, json_datas[i]["src_image"])
+        ref_image_path = os.path.join(dataset_path, json_datas[i]["ref_image"])
+        ref_mask_path = os.path.join(dataset_path, json_datas[i]["ref_mask"])
+        src_mask_path = os.path.join(dataset_path, json_datas[i]["src_mask"])
+        src_prompt = json_datas[i]["src_prompt"]
+        ref_prompt = json_datas[i]["ref_prompt"]
+        tgt_prompt = json_datas[i]["tgt_prompt"]
+        prompts = [src_prompt, tgt_prompt, ref_prompt]
+        ref_mask = load_mask(ref_mask_path)   #[1,1,512,512]
+        src_mask = load_mask(src_mask_path)
 
-    visualize_dift(dift_map_dict, src_mask, ref_mask, ref_image_path)
+        # get dift features & gen dift map
+        print("calculating dift features......")
+        sdfeaturizer = SDFeaturizer(model=ldm_stable)
+        dift_latent_store.reset()
+        sdfeaturizer.forward(src_image_path, prompt=src_prompt, ensemble_size=8, t=451, up_ft_index=1, model=ldm_stable) 
+        src_dift = dift_latent_store.dift_features["1"].mean(0, keepdim=True)   # 1, c, 32, 32
+        dift_latent_store.reset()
+        sdfeaturizer.forward(ref_image_path, prompt=ref_prompt, ensemble_size=8, t=451, up_ft_index=1, model=ldm_stable)
+        ref_dift = dift_latent_store.dift_features["1"].mean(0, keepdim=True)   # 1, c, 32, 32
+        dift_map_dict, _ = gen_dift_map_dict(src_dift, ref_dift, ref_mask=ref_mask, use_topk=args.topk)
+        print("finishing dift features mapping!")
 
-    #src image and ref image inversion
-    print("inverting src image and ref image......")
-    if args.BeLM:
-        sd_params = {"prompt":ref_prompt, "negative_prompt":"", "seed":seed, "guidance_scale":GUIDANCE_SCALE, "num_inference_steps":50}
-        ref_latent = BeLM.pil_to_latents(image_path=ref_image_path, sd_pipe=ldm_stable)
-        ref_intermediate, ref_second_intermediate = BeLM.latent_to_intermediate(sd_pipe=ldm_stable, sd_params=sd_params, latent=ref_latent, freeze_step=0)
+        visualize_dift(dift_map_dict, src_mask, ref_mask, ref_image_path)
+
+        #src image and ref image inversion
+        print("inverting src image and ref image......")
         
-        sd_params = {"prompt":src_prompt, "negative_prompt":"", "seed":seed, "guidance_scale":GUIDANCE_SCALE, "num_inference_steps":50}
-        src_latent = BeLM.pil_to_latents(image_path=src_image_path, sd_pipe=ldm_stable)
-        src_intermediate, src_second_intermediate = BeLM.latent_to_intermediate(sd_pipe=ldm_stable, sd_params=sd_params, latent=src_latent, freeze_step=0)
-        
-    else:
         ddim_inversion = DDIM_Inversion(ldm_stable, NUM_DDIM_STEPS=NUM_DIFFUSION_STEPS)
         _, ddim_latents = ddim_inversion.invert(src_image_path, prompts[0])
         uncond_embeddings = ddim_inversion.null_optimization(ddim_latents, num_inner_steps=10, epsilon=1e-5)
         
         _, ref_latents = ddim_inversion.invert(ref_image_path, prompts[2])
         ref_uncond_embeddings = ddim_inversion.null_optimization(ref_latents, 10, 1e-5)
-        
-    print("finishing src image and ref image inversion!")
+            
+        print("finishing src image and ref image inversion!")
 
-    #hyper parameters
-    src_step_list = [int(x) for x in args.src_step.split(",")]   
-    ref_step2_list = [int(x) for x in args.ref_step2.split(",")] 
-    mask_weight_list = [float(x) for x in args.mask_weight.split(",")]    
-    ref_q_step_list = [int(x) for x in args.ref_q_step.split(",")] 
-    cross_step_list = [float(x) for x in args.cross_step.split(",")] 
-    ref_step1 = int(args.ref_step1.split(",")[0])
-    ref_q_res_list = [int(x) for x in args.ref_q_res.split(",")]
-
-    hyper_param_list = itertools.product(src_step_list, ref_step2_list, mask_weight_list, ref_q_step_list, cross_step_list, ref_q_res_list)
-    for src_step, ref_step2, mask_weight, ref_q_step, cross_step, ref_q_res in hyper_param_list:
-        #define local blend & controller
         lb_words = json_datas[i]["local_blend"]
         lb = LocalBlend(prompts, lb_words, tokenizer=ldm_stable.tokenizer)
+        lb.set_mask(load_mask(src_mask_path, H=64, W=64).to("cuda"))
         controller = AttentionReplace(prompts, NUM_DIFFUSION_STEPS,
-                                    cross_replace_steps={"default_": 1.0, lb_words[1]: cross_step},   #数值越大，覆盖越多，数值越小，保留越多
-                                    self_replace_steps=0.2,   #已弃用，等价src_step
+                                    cross_replace_steps={"default_": 1.0, lb_words[1]: args.cross_step},   #数值越大，覆盖越多，数值越小，保留越多
+                                    self_replace_steps=0.2,   #已弃用，等价self_src_q_time_end
                                     local_blend=lb,
                                     tokenizer=ldm_stable.tokenizer
                                     )
         controller.set_dift_map_dict(dift_map_dict=dift_map_dict)
 
         output_dir = f"./results/{datetime.date.today()}/{i}"
-        output_dir = os.path.join(output_dir, f"{src_step}_{ref_step2}_{mask_weight}_{cross_step}_{ref_q_step}_{ref_q_res}")
+        output_dir = os.path.join(output_dir, f"{args.self_src_q_time_end}_{args.self_ref_kv_time_end}_{args.mask_weight}_{args.cross_step}_{args.self_ref_q_time_end}_{args.self_ref_q_layer}")
         os.makedirs(output_dir, exist_ok=True)
 
         #register controller and run
-        if args.BeLM:
-            sd_params = {"prompt":[src_prompt, tgt_prompt, ref_prompt], "negative_prompt":"", "seed":seed, "guidance_scale":GUIDANCE_SCALE, "num_inference_steps":50}
-            BeLM.intermediate_to_latent(ldm_stable, controller, sd_params, src_intermediate, src_second_intermediate, ref_intermediate, ref_second_intermediate, freeze_step=0, output_dir=output_dir)
-        else:
-            run_and_display(prompts, controller, latent=ddim_latents[-1], run_baseline=True, uncond_embeddings=uncond_embeddings, 
-                            ref_latent=ref_latents[-1], ref_uncond_embeddings=ref_uncond_embeddings, seed=seed)
+        
+        run_and_display(prompts, controller, latent=ddim_latents[-1], run_baseline=True, uncond_embeddings=uncond_embeddings, 
+                        ref_latent=ref_latents[-1], ref_uncond_embeddings=ref_uncond_embeddings, seed=seed)
 
         show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=0).save(os.path.join(output_dir,"show_cross_attn_0.png"))
         show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=1).save(os.path.join(output_dir,"show_cross_attn_1.png"))
         show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=2).save(os.path.join(output_dir,"show_cross_attn_2.png"))
+
+        controller.enable = False
 
     # controller = AttentionStore()
     # image, x_t = run_and_display(prompts, controller, latent=None, run_baseline=False, generator=g_cpu)

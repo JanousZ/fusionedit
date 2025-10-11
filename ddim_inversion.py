@@ -48,7 +48,7 @@ def load_512(image_path, left=0, right=0, top=0, bottom=0):
 
 class DDIM_Inversion:
     
-    #z_t->z_t-1
+    #sample z_t-1 | z_t
     def prev_step(self, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
         prev_timestep = timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
@@ -59,7 +59,7 @@ class DDIM_Inversion:
         prev_sample = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
         return prev_sample
     
-    #z_t->z_t+1
+    #sample z_t+1 | z_t
     def next_step(self, model_output: Union[torch.FloatTensor, np.ndarray], timestep: int, sample: Union[torch.FloatTensor, np.ndarray]):
         timestep, next_timestep = min(timestep - self.scheduler.config.num_train_timesteps // self.scheduler.num_inference_steps, 999), timestep
         alpha_prod_t = self.scheduler.alphas_cumprod[timestep] if timestep >= 0 else self.scheduler.final_alpha_cumprod
@@ -74,6 +74,7 @@ class DDIM_Inversion:
         latents_input = torch.cat([latents] * 2)
         if context is None:
             context = self.context
+        # inversion使用cfg=1, denoise使用cfg
         guidance_scale = 1 if is_forward else self.guidance_scale
         noise_pred = self.model.unet(latents_input, t, encoder_hidden_states=context)["sample"]
         noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
