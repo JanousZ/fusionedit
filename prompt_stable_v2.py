@@ -145,7 +145,7 @@ class AttentionControl(abc.ABC):
             out_u_ref = self.attn_batch(qu[2*num_heads:], ku[2*num_heads:], vu[2*num_heads:], None, None, is_cross, place_in_unet, num_heads, **kwargs)
             out_c_ref = self.attn_batch(qc[2*num_heads:], kc[2*num_heads:], vc[2*num_heads:], None, None, is_cross, place_in_unet, num_heads, **kwargs)
 
-            if self.cur_step < args.self_src_q_time_end and self.cur_att_layer // 2 in self.src_self_layer_idx:
+            if self.cur_step < args.self_src_q_time_end and self.cur_att_layer // 2 in self.self_src_q_layer_idx:
             #q_tgt = q_src  k_tgt = k_src 保持整体结构
                 qu[num_heads: 2*num_heads] = qu[:num_heads]
                 qc[num_heads: 2*num_heads] = qc[:num_heads]
@@ -155,7 +155,7 @@ class AttentionControl(abc.ABC):
             #最好来个时间限制
             res = int(math.sqrt(q.shape[1]))
             if self.dift_map_dict is not None:
-                if self.cur_step < args.self_ref_q_time_end and self.cur_step >= args.self_ref_q_time_start and res >= args.self_ref_q_layer:
+                if self.cur_step < args.self_ref_q_time_end and self.cur_step >= args.self_ref_q_time_start and self.cur_att_layer // 2 in args.self_ref_q_layer_idx:
                     mask = self.get_src_mask(src_mask, H=res, W=res).to(device)   #[res*res] 0背景 1前景
                     foreground_index, background_index = torch.where(mask == 1)[0], torch.where(mask == 0)[0]
                     dift_map = self.dift_map_dict[f"{res}"] #[h*w]
@@ -163,7 +163,7 @@ class AttentionControl(abc.ABC):
                     qu[num_heads: 2*num_heads, foreground_index, :] = qu[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qu[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
                     qc[num_heads: 2*num_heads, foreground_index, :] = qc[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qc[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
 
-            if self.cur_step < args.self_ref_kv_time_end and self.cur_att_layer // 2 in self.ref_self_layer_idx:
+            if self.cur_step < args.self_ref_kv_time_end and self.cur_att_layer // 2 in self.self_ref_kv_layer_idx:
                 #q_tgt [k_tgt,k_ref] [v_tgt,v_ref] 
                 out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:], vu[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
                 out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:], vc[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
@@ -216,6 +216,8 @@ class AttentionControl(abc.ABC):
         else:
             #self_attn_control, activate when calculate both cond_noise and uncond_noise
             out = self.self_forward(q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs)
+        
+        print(self.cur_att_layer, "cross" if is_cross else "self", out.shape)
 
         self.cur_att_layer += 1    #record that finish one attn layer
 
@@ -251,9 +253,9 @@ class AttentionControl(abc.ABC):
         self.num_att_layers = -1    #Unet中注册的的CrossAttention层总数
         self.cur_att_layer = 0
         self.LOW_RESOURCE = LOW_RESOURCE
-        self.src_self_layer_idx = list(range(0, 16))
-        self.ref_self_layer_idx = list(range(0, 16))
-        self.src_cross_layer_idx = list(range(0, 16))
+        self.self_src_q_layer_idx = list(range(0, 16))  
+        self.self_ref_kv_layer_idx = list(range(0, 16))
+        self.cross_src_layer_idx = list(range(0, 16))
         self.dift_map_dict = None
         self.enable = True
 
@@ -455,15 +457,15 @@ def show_self_attention_comp(attention_store: AttentionStore, res: int, from_whe
         images.append(image)
     ptp_utils.view_images(np.concatenate(images, axis=1))
 
-def run_and_display(prompts, controller, latent=None, run_baseline=False, generator=None, uncond_embeddings=None, ref_latent=None, ref_uncond_embeddings=None, seed=3407):
+def run_and_display(prompts, controller, latent=None, run_baseline=False, generator=None, uncond_embeddings=None, ref_latent=None, ref_uncond_embeddings=None, seed=3407, data_inds=None):
 
     print("with prompt-to-prompt")
     images, x_t = ptp_utils.text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DIFFUSION_STEPS, guidance_scale=GUIDANCE_SCALE, 
                                                   generator=generator, low_resource=LOW_RESOURCE, uncond_embeddings=uncond_embeddings, ref_latent=ref_latent, 
                                                   ref_uncond_embeddings=ref_uncond_embeddings, randomzt=False)
-    Image.fromarray(images[1]).save(os.path.join(output_dir,"P2P_tgt.png"))
+    Image.fromarray(images[1]).save(os.path.join(output_dir,f"{data_inds}.jpg"))
     images = ptp_utils.view_images(images)
-    images.save(os.path.join(output_dir,f"P2P_{seed}.png"))
+    images.save(os.path.join(output_dir,f"compare_{data_inds}.jpg"))
 
     # controller.reset()
     # images, x_t = ptp_utils.text2image_ldm_stable(ldm_stable, prompts, controller, latent=latent, num_inference_steps=NUM_DIFFUSION_STEPS, guidance_scale=GUIDANCE_SCALE, 
@@ -487,15 +489,26 @@ if __name__ == "__main__":
     #超参数设置
     parser = argparse.ArgumentParser(description="hyper parameters")
 
+    parser.add_argument("--expid", required=True, type=int)
     parser.add_argument("--self_ref_kv_time_end", type=int, default="50")
+    parser.add_argument("--self_ref_kv_layer_idx", type=int, nargs=2, default=[0, 16])
     parser.add_argument("--self_ref_q_time_start", type=int, default="0")
-    parser.add_argument("--self_ref_q_time_end", type=int, default="40")
-    parser.add_argument("--self_ref_q_layer", type=int, default="8")
-    parser.add_argument("--self_src_q_time_end", type=int, default="45")
+    parser.add_argument("--self_ref_q_time_end", type=int, default="50")
+    parser.add_argument("--self_ref_q_layer_idx", type=int, nargs=2, default=[0, 16])
+    parser.add_argument("--self_src_q_time_end", type=int, default="50")
+    parser.add_argument("--self_src_q_layer_idx", type=int, nargs=2, default=[0, 16])
     parser.add_argument("--mask_weight", type=float, default="3.0")
     parser.add_argument("--cross_step", type=float, default="0.6")
+    parser.add_argument("--cross_src_layer_idx", type=int, nargs=2, default=[0, 16])
     parser.add_argument("--topk", action="store_true")
     args = parser.parse_args()
+
+    output_dir = f"./results/{datetime.date.today()}/{args.expid}"
+    os.makedirs(output_dir, exist_ok=True)
+    # 保存为 JSON 文件
+    param_save_path = os.path.join(output_dir, f"exp_{args.expid}_config.json")
+    with open(param_save_path, "w") as f:
+        json.dump(vars(args), f, indent=4)
 
     #model loading and config
     LOW_RESOURCE = False 
@@ -570,18 +583,14 @@ if __name__ == "__main__":
                                     )
         controller.set_dift_map_dict(dift_map_dict=dift_map_dict)
 
-        output_dir = f"./results/{datetime.date.today()}/{i}"
-        output_dir = os.path.join(output_dir, f"{args.self_src_q_time_end}_{args.self_ref_kv_time_end}_{args.mask_weight}_{args.cross_step}_{args.self_ref_q_time_end}_{args.self_ref_q_layer}")
-        os.makedirs(output_dir, exist_ok=True)
-
         #register controller and run
         
         run_and_display(prompts, controller, latent=ddim_latents[-1], run_baseline=True, uncond_embeddings=uncond_embeddings, 
-                        ref_latent=ref_latents[-1], ref_uncond_embeddings=ref_uncond_embeddings, seed=seed)
+                        ref_latent=ref_latents[-1], ref_uncond_embeddings=ref_uncond_embeddings, seed=seed, data_inds=i)
 
-        show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=0).save(os.path.join(output_dir,"show_cross_attn_0.png"))
-        show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=1).save(os.path.join(output_dir,"show_cross_attn_1.png"))
-        show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=2).save(os.path.join(output_dir,"show_cross_attn_2.png"))
+        # show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=0).save(os.path.join(output_dir,"show_cross_attn_0.png"))
+        # show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=1).save(os.path.join(output_dir,"show_cross_attn_1.png"))
+        # show_cross_attention(controller, res=16, from_where=("up", "down"), tokenizer=ldm_stable.tokenizer, select=2).save(os.path.join(output_dir,"show_cross_attn_2.png"))
 
         controller.enable = False
 
