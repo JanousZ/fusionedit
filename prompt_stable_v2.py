@@ -105,6 +105,10 @@ class AttentionControl(abc.ABC):
 
         sim = torch.einsum("h i d, h j d -> h i j", q, k) * kwargs.get("scale")    #[8, qlen, klen]
 
+        if kwargs.get("dift_distance") is not None:
+            sim_dift = sim[:,:,H*W:] * kwargs["dift_distance"]
+            sim[:,foreground_index,H*W:] = sim_dift[:,foreground_index,:]
+
         if kwargs.get("mode") == 'mask':
             #mask可能是导致质量低的原因
             mask = self.get_ref_mask(ref_mask, mask_weight=args.mask_weight, H=H, W=W).to(device)   #[1,1,512,512]
@@ -155,18 +159,20 @@ class AttentionControl(abc.ABC):
             #最好来个时间限制
             res = int(math.sqrt(q.shape[1]))
             if self.dift_map_dict is not None:
-                if self.cur_step < args.self_ref_q_time_end and self.cur_step >= args.self_ref_q_time_start and self.cur_att_layer // 2 in args.self_ref_q_layer_idx:
+                if self.cur_step < args.self_ref_q_time_end and self.cur_step >= args.self_ref_q_time_start and self.cur_att_layer // 2 in self.self_ref_q_layer_idx:
                     mask = self.get_src_mask(src_mask, H=res, W=res).to(device)   #[res*res] 0背景 1前景
                     foreground_index, background_index = torch.where(mask == 1)[0], torch.where(mask == 0)[0]
                     dift_map = self.dift_map_dict[f"{res}"] #[h*w]
                     q_mix_scale = 1.0
-                    qu[num_heads: 2*num_heads, foreground_index, :] = qu[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qu[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
-                    qc[num_heads: 2*num_heads, foreground_index, :] = qc[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qc[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
+                    # qu[num_heads: 2*num_heads, foreground_index, :] = qu[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qu[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
+                    # qc[num_heads: 2*num_heads, foreground_index, :] = qc[2*num_heads:, dift_map[foreground_index], :] * q_mix_scale + qc[num_heads:2*num_heads, foreground_index, :] * (1 - q_mix_scale)
+
+                    dift_distance = self.dift_distance_dict[f"{res}"] if self.cur_step < args.self_ref_q_time_end and self.cur_step >= args.self_ref_q_time_start and self.cur_att_layer // 2 in self.self_ref_q_layer_idx else None
 
             if self.cur_step < args.self_ref_kv_time_end and self.cur_att_layer // 2 in self.self_ref_kv_layer_idx:
                 #q_tgt [k_tgt,k_ref] [v_tgt,v_ref] 
-                out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:], vu[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
-                out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:], vc[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", **kwargs)
+                out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[num_heads:], vu[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", dift_distance = dift_distance, foreground_index = foreground_index, **kwargs)
+                out_c_tgt = self.attn_batch(qc[num_heads:2*num_heads], kc[num_heads:], vc[num_heads:],None, None, is_cross, place_in_unet, num_heads, mode="mask", dift_distance = dift_distance, foreground_index = foreground_index, **kwargs)
 
                 #q_tgt k_ref v_ref 
                 # out_u_tgt = self.attn_batch(qu[num_heads:2*num_heads], ku[2*num_heads:], vu[2*num_heads:],None, None, is_cross, place_in_unet, num_heads, **kwargs)
@@ -216,8 +222,6 @@ class AttentionControl(abc.ABC):
         else:
             #self_attn_control, activate when calculate both cond_noise and uncond_noise
             out = self.self_forward(q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs)
-        
-        print(self.cur_att_layer, "cross" if is_cross else "self", out.shape)
 
         self.cur_att_layer += 1    #record that finish one attn layer
 
@@ -238,8 +242,9 @@ class AttentionControl(abc.ABC):
         src_mask = (src_mask > 0).float().flatten()
         return src_mask
     
-    def set_dift_map_dict(self, dift_map_dict = None):
+    def set_dift_map_dict(self, dift_map_dict = None, dift_distance_dict = None):
         self.dift_map_dict = dift_map_dict
+        self.dift_distance_dict = dift_distance_dict
 
     def reset(self):
         self.cur_step = 0
@@ -253,8 +258,9 @@ class AttentionControl(abc.ABC):
         self.num_att_layers = -1    #Unet中注册的的CrossAttention层总数
         self.cur_att_layer = 0
         self.LOW_RESOURCE = LOW_RESOURCE
-        self.self_src_q_layer_idx = list(range(0, 16))  
-        self.self_ref_kv_layer_idx = list(range(0, 16))
+        self.self_src_q_layer_idx = list(range(args.self_src_q_layer_idx[0], args.self_src_q_layer_idx[1]))  
+        self.self_ref_kv_layer_idx = list(range(args.self_ref_kv_layer_idx[0], args.self_ref_kv_layer_idx[1]))
+        self.self_ref_q_layer_idx = list(range(args.self_ref_q_layer_idx[0], args.self_ref_q_layer_idx[1]))
         self.cross_src_layer_idx = list(range(0, 16))
         self.dift_map_dict = None
         self.enable = True
@@ -522,7 +528,7 @@ if __name__ == "__main__":
     g_cpu = torch.Generator().manual_seed(seed)
     
     dataset_path = "/home/yanzhang/dataset/customp2p"
-    json_path = "prompt.json"
+    json_path = "prompt2.json"
     
     json_path = os.path.join(dataset_path,json_path)
     with open(json_path, "r", encoding="utf-8") as f:
@@ -555,7 +561,7 @@ if __name__ == "__main__":
         dift_latent_store.reset()
         sdfeaturizer.forward(ref_image_path, prompt=ref_prompt, ensemble_size=8, t=451, up_ft_index=1, model=ldm_stable)
         ref_dift = dift_latent_store.dift_features["1"].mean(0, keepdim=True)   # 1, c, 32, 32
-        dift_map_dict, _ = gen_dift_map_dict(src_dift, ref_dift, ref_mask=ref_mask, use_topk=args.topk)
+        dift_map_dict, dift_distance_dict = gen_dift_map_dict(src_dift, ref_dift, ref_mask=ref_mask, use_topk=args.topk)
         print("finishing dift features mapping!")
 
         visualize_dift(dift_map_dict, src_mask, ref_mask, ref_image_path)
@@ -568,7 +574,7 @@ if __name__ == "__main__":
         uncond_embeddings = ddim_inversion.null_optimization(ddim_latents, num_inner_steps=10, epsilon=1e-5)
         
         _, ref_latents = ddim_inversion.invert(ref_image_path, prompts[2])
-        ref_uncond_embeddings = ddim_inversion.null_optimization(ref_latents, 10, 1e-5)
+        ref_uncond_embeddings = ddim_inversion.null_optimization(ref_latents, 15, 1e-5)
             
         print("finishing src image and ref image inversion!")
 
@@ -581,7 +587,7 @@ if __name__ == "__main__":
                                     local_blend=lb,
                                     tokenizer=ldm_stable.tokenizer
                                     )
-        controller.set_dift_map_dict(dift_map_dict=dift_map_dict)
+        controller.set_dift_map_dict(dift_map_dict=dift_map_dict, dift_distance_dict=dift_distance_dict)
 
         #register controller and run
         

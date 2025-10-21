@@ -1,16 +1,11 @@
 #new version
-export CUDA_VISIBLE_DEVICES=0
-python prompt_stable_v2.py --expid 1 \
-    --self_ref_kv_time_end 50 \
-    --self_ref_kv_layer_idx 0 16 \
-    --self_ref_q_time_start 0 \
-    --self_ref_q_time_end 40 \
-    --self_ref_q_layer_idx 8 9 \
-    --self_src_q_time_end 50 \
-    --self_src_q_layer_idx 0 16 \
+export CUDA_VISIBLE_DEVICES=1
+python prompt_stable_v2.py --expid 10 \
+    --self_ref_kv_time_end 50 --self_ref_kv_layer_idx 0 16 \
+    --self_ref_q_time_end 40 --self_ref_q_layer_idx 0 16 \
+    --self_src_q_time_end 45 --self_src_q_layer_idx 0 16 \
     --mask_weight 3.0 \
-    --cross_step 0.6 \
-    --cross_src_layer_idx 0 16
+    --cross_step 0.6 --cross_src_layer_idx 0 16
 
 暂时来说 cross部分先不动，因为这是前人验证过的，并且代码对应逻辑还未完善
 
@@ -48,5 +43,9 @@ python prompt_stable_v2.py --expid 1 \
 30 self torch.Size([6, 4096, 320])
 31 cross torch.Size([6, 4096, 320])
 
-结论1:expid1，self_src_q_time_end不能太大,至少不能是50，不然原图中的细节会被完整保留（有残留）。
+注意 ref_q当时是除了中间层其他都替换了，跟现在的range逻辑不一样
+
+结论1:expid1，self_src_q_time_end不能太大,至少不能是50，不然原图中的细节会被完整保留（有残留）。    40
 结论2:expid1, self_ref_q_layer_idx不能太少，至少不能是[8,9),不然换不过来。
+结论3:self_ref_q_time_end也不要太大,至少不能是50，因为它是不准确的，如果太大会造成最终的模糊。     40
+而且self_ref_q和self_src_q之间应该有一个大小关系
