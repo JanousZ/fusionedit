@@ -1,2 +1,53 @@
+# Existing local baselines and generated results
 baseline
 results
+
+# Local benchmark assets (kept on disk, excluded from Git uploads)
+/asset/
+
+# Model weights and serialized checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.gguf
+*.ggml
+*.h5
+*.hdf5
+*.msgpack
+*.pkl
+*.pickle
+
+# Cached tensors and binary arrays
+*.npy
+*.npz
+
+# Local model directories (root-only to preserve source packages named models)
+/models/
+/weights/
+/model_weights/
+/pretrained_models/
+/checkpoints/
+**/checkpoint-*/
+
+# Large archives and packaged datasets
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tbz2
+*.tar.xz
+*.txz
+*.7z
+*.rar
+
+# Generated outputs, logs, and runtime caches
+/results_sdxl/
+/logs/
+__pycache__/
+*.py[cod]
+.cache/
+.hf_cache/
